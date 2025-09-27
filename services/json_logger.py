@@ -8,6 +8,8 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 
+# test
+
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:  # type: ignore[override]
         payload: Dict[str, Any] = {
