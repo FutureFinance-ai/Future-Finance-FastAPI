@@ -1,63 +1,21 @@
-from __future__ import annotations
+import secrets
+import string
 
-from typing import Optional
+# Define the character set to use
+# This example uses a strong character set including letters, digits, and punctuation
+alphabet = string.ascii_letters + string.digits + string.punctuation
 
-from fastapi import Depends
-from pydantic import BaseModel, Field
-from surrealdb import AsyncSurreal
-from services.config import getenv_str
-from users.user_repo import SurrealUserDatabase
-from surrealdb import Surreal
-from .config import settings
-import logging
+# Generate a 256-bit (32-byte) random token and convert it to a hex string.
+# Each hex character represents 4 bits, so 32 bytes (256 bits) will result in 64 hex characters.
+random_hex_string = secrets.token_hex(32)
 
+# If a string of a specific length using a custom character set is desired,
+# calculate the required length based on the character set size.
+# For example, to get a string with at least 256 bits of entropy using the 'alphabet' defined above:
+# log2(len(alphabet)) gives the bits per character.
+# 256 / log2(len(alphabet)) gives the required number of characters.
+# For a practical example, let's generate a string of 64 characters from the alphabet:
+random_char_string = ''.join(secrets.choice(alphabet) for i in range(64))
 
-
-
-db: Surreal = None
-# --- Lifecycle management ---
-async def init_db() -> None:
-    """Initialize SurrealDB connection on app startup."""
-    
-    global db
-    db = AsyncSurreal(settings.SURREALDB_URL)
-    try:
-        await db.signin({"username": settings.SURREALDB_USER, "password": settings.SURREALDB_PASS})
-    except Exception as e:
-        raise Exception(f"Error initializing app database connection. Check your login credentials: {e}") from e
-
-    try:
-        await db.use(settings.SURREALDB_NS, settings.SURREALDB_DB)
-
-        test_result = await db.query("INFO FOR DB")
-    except Exception as e:
-        raise Exception(f"Error initializing app database connection. Check your credentials: {e}") from e
-
-
-async def close_db() -> None:
-    """Close SurrealDB connection on app shutdown."""
-    try:
-        await db.close()
-    except Exception as e:
-        raise Exception("Error closing app database connection") from e
-
-
-# --- FastAPI dependencies ---
-async def get_db() -> AsyncSurreal:
-    """Dependency to inject the Surreal client into routes."""
-    if db is None:
-        await init_db()
-    yield db
-
-
-async def get_user_db(db: AsyncSurreal = Depends(get_db)) -> SurrealUserDatabase:
-    if db is None:
-        await init_db()
-    yield SurrealUserDatabase(db, "users")
-
-
-
-
-
-
-
+print(f"256-bit equivalent random hex string (64 characters): {random_hex_string}")
+print(f"Random string using a custom alphabet (64 characters): {random_char_string}")

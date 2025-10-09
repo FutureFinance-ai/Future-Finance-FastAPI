@@ -13,6 +13,11 @@ class UserManager(BaseUserManager[User, str]):
     reset_password_token_secret = settings.ENV_RESET_PASSWORD_TOKEN_SECRET
     verification_token_secret = settings.ENV_VERIFICATION_TOKEN_SECRET
 
+    def parse_id(self, value: str) -> str:
+        # Our IDs are stored as SurrealDB record ids like "users:<uuid>".
+        # We store and compare them as strings, so return as-is.
+        return value
+
     async def on_after_register(self, user: User, request: Optional[Request] = None):
         print(f"User {user.email} has registered. Triggering email verification.")  # at least log something
 

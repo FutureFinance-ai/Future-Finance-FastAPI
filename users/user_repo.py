@@ -14,10 +14,20 @@ class SurrealUserDatabase(BaseUserDatabase[User, str]):
         self.collection = collection
 
     async def get(self, id: Union[str, int]) -> Optional[User]:
-        record = await self.db.select(f"{self.collection}:{id}")
-        if record:
-            return User(**self._normalize_record(record))
-        return None
+        user_id = str(id).split(":")[1]
+        try:
+            query = "SELECT * FROM type::thing('users', $user_id)"
+            vars = {
+                "user_id": user_id
+            }
+
+            result = await self.db.query(query, vars)
+            record = result[0]
+            if record:
+                return User(**self._normalize_record(record))
+            return None
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Error querying user by id: {exc}")
 
     async def get_by_email(self, email: str) -> Optional[User]:
         logger = logging.getLogger(__name__)
