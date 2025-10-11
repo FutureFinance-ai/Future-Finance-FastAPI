@@ -5,7 +5,7 @@ import os
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Dict, Optional
-from services.config import ARTIFACTS_BASE_DIR
+from pdf.config import ARTIFACTS_BASE_DIR, ARTIFACTS_GZIP
 
 
 class _JsonEncoder(json.JSONEncoder):
@@ -64,10 +64,15 @@ class ArtifactStorage:
                 # best-effort; do not fail pipeline on write issues
                 pass
 
-        extracted_path = os.path.join(doc_dir, "extracted.json")
+        extracted_path = os.path.join(doc_dir, "extracted.json.gz" if ARTIFACTS_GZIP else "extracted.json")
         try:
-            with open(extracted_path, "w", encoding="utf-8") as f:
-                json.dump(artifacts, f, ensure_ascii=False, indent=2, cls=_JsonEncoder)
+            if ARTIFACTS_GZIP:
+                import gzip
+                with gzip.open(extracted_path, "wt", encoding="utf-8") as f:
+                    json.dump(artifacts, f, ensure_ascii=False, indent=2, cls=_JsonEncoder)
+            else:
+                with open(extracted_path, "w", encoding="utf-8") as f:
+                    json.dump(artifacts, f, ensure_ascii=False, indent=2, cls=_JsonEncoder)
         except Exception:
             pass
 

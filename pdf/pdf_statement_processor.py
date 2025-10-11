@@ -7,16 +7,48 @@ import hashlib
 import re
 from datetime import datetime, date
 from decimal import Decimal, InvalidOperation
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from threading import Semaphore
+from pdf.json_logger import get_json_logger
+from pdf import config
+from pdf.artifact_storage import ArtifactStorage
 
 import pdfplumber
-from services.statement_parsers import ParserRegistry, NgGenericParser, OpayParser
-from services.json_logger import get_json_logger
-from services import config
+from pdf.statement_parsers import ParserRegistry, NgGenericParser, OpayParser
+from pdf.pdf_pipeline.tokenization import (
+    words_to_rows,
+    infer_column_bands,
+    assign_tokens_to_columns,
+)
+from pdf.pdf_pipeline.debug_overlay import render_page_overlay
+
+# Precompiled regex patterns used across normalization/text parsing
+AMOUNT_TOKEN_RE_STR = r"(?:\(?-?\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?\)?|\(?-?\d+(?:\.\d{2})?\)?)"
+DATE_TOKEN_RE_STR = r"\b(?:\d{1,2}[\-/]\d{1,2}[\-/]\d{2,4}|\d{4}[\-/]\d{1,2}[\-/]\d{1,2}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{2,4})\b"
+LINE_RE = re.compile(rf"(?P<date>{DATE_TOKEN_RE_STR}).{{1,80}}?(?P<amount>{AMOUNT_TOKEN_RE_STR})(?:\s+(?P<balance>{AMOUNT_TOKEN_RE_STR}))?", re.IGNORECASE)
+
+
+def _ocr_png_to_text(png_bytes: bytes, lang: str, oem: int, psm: int) -> str:
+    try:
+        from PIL import Image
+        import io
+        img = Image.open(io.BytesIO(png_bytes))
+        cfg = f"--oem {int(oem)} --psm {int(psm)}"
+        return pytesseract.image_to_string(img, lang=lang, config=cfg)
+    except Exception:
+        return ""
+
 try:
     import pytesseract  # type: ignore
     _HAVE_TESSERACT = True
 except Exception:
     _HAVE_TESSERACT = False
+
+try:
+    from babel.numbers import parse_decimal as babel_parse_decimal  # type: ignore
+    _HAVE_BABEL = True
+except Exception:
+    _HAVE_BABEL = False
 
 
 @dataclass
@@ -37,6 +69,7 @@ class ExtractionResult:
     pages_count: int
     page_texts: List[str] = field(default_factory=list)
     page_tables: List[List[List[List[str]]]] = field(default_factory=list)
+    page_words: List[List[Dict[str, object]]] = field(default_factory=list)
     image_based_pages: List[bool] = field(default_factory=list)
     first_page_text: str = ""
     metadata: Dict[str, object] = field(default_factory=dict)
@@ -62,6 +95,13 @@ class PdfStatementProcessor:
         # Security limits
         self.max_pages = config.MAX_PAGES
         self.max_chars_per_page = config.MAX_CHARS_PER_PAGE
+        # PII masking flags
+        self.mask_account_like_numbers_only = getattr(config, "PII_MASK_ACCOUNT_ONLY", True)
+        self.mask_amounts = getattr(config, "PII_MASK_AMOUNTS", False)
+        # OCR throttling
+        self._ocr_semaphore = Semaphore(max(1, int(getattr(config, "OCR_MAX_CONCURRENT", 2))))
+        # OCR process pool (for CPU-heavy OCR invocations)
+        self._ocr_pool: Optional[ProcessPoolExecutor] = None
 
     def extract(self, content: bytes, filename: Optional[str] = None) -> ExtractionResult:
         """
@@ -76,70 +116,155 @@ class PdfStatementProcessor:
 
         page_texts: List[str] = []
         page_tables: List[List[List[List[str]]]] = []
+        page_words: List[List[Dict[str, object]]] = []
         image_based_pages: List[bool] = []
         page_meta: List[Dict[str, object]] = []
         ocr_pages: List[int] = []
 
-        with pdfplumber.open(BytesIO(content)) as pdf:
-            pages_count = len(pdf.pages)
-            if pages_count > self.max_pages:
-                self.logger.warning("pdf_pages_exceed_limit", extra={"extra": {"document_id": document_id, "pages": pages_count, "max_pages": self.max_pages}})
-                pages_iter = pdf.pages[: self.max_pages]
-            else:
-                pages_iter = pdf.pages
-            for idx, page in enumerate(pages_iter):
-                # Text extraction
-                text = page.extract_text() or ""
+        # Precompiled regex already at module scope
 
-                # Table extraction (list of tables -> list of rows -> list of cells)
-                tables_raw = page.extract_tables() or []
+        def _has_rulings(page) -> bool:
+            try:
+                return bool(getattr(page, "lines", []) or getattr(page, "curves", []))
+            except Exception:
+                return False
+
+        def process_single_page(idx: int) -> Tuple[int, Dict[str, object]]:
+            with pdfplumber.open(BytesIO(content)) as pdf_local:
+                page = pdf_local.pages[idx]
+                text = page.extract_text() or ""
+                words: List[Dict[str, object]] = []
+
                 tables_norm: List[List[List[str]]] = []
+                tables_strategy = "stream"
+                tables_raw_lattice = []
+                # Lattice only if rulings are present (cheap precheck)
+                if _has_rulings(page):
+                    try:
+                        tables_raw_lattice = page.extract_tables(table_settings={
+                            "vertical_strategy": "lines",
+                            "horizontal_strategy": "lines",
+                            "intersection_tolerance": 3,
+                            "snap_tolerance": 3,
+                            "join_tolerance": 3,
+                        }) or []
+                    except Exception:
+                        tables_raw_lattice = []
+                tables_raw = tables_raw_lattice
+                if not tables_raw:
+                    try:
+                        tables_raw = page.extract_tables() or []
+                    except Exception:
+                        tables_raw = []
+                    tables_strategy = "stream" if tables_raw else "none"
+                else:
+                    tables_strategy = "lattice"
                 for table in tables_raw:
                     norm_rows: List[List[str]] = []
                     for row in table:
-                        # Normalize cell values to strings and strip whitespace
                         norm_rows.append([str(cell if cell is not None else "").strip() for cell in row])
                     tables_norm.append(norm_rows)
 
-                # Heuristic: page might be image-based if there are images and no text
                 has_images = bool(getattr(page, "images", []))
                 is_image_like = has_images and (len(text.strip()) == 0)
-
-                # Optional OCR fallback
+                # Gate token extraction: only compute when needed (no tables) or for debug overlay
+                if not tables_norm or getattr(config, "DEBUG_OVERLAY_ENABLED", False):
+                    try:
+                        words = page.extract_words(
+                            keep_blank_chars=True,
+                            use_text_flow=True,
+                            x_tolerance=2,
+                            y_tolerance=2,
+                        ) or []
+                    except Exception:
+                        words = []
                 ocr_applied = False
                 if (self.ocr_enabled and _HAVE_TESSERACT and len(ocr_pages) < self.ocr_max_pages and (is_image_like or len(text.strip()) == 0)):
-                    try:
-                        # Render page to image via pdfplumber
-                        page_image = page.to_image(resolution=self.ocr_dpi)
-                        pil_img = getattr(page_image, "image", None)
-                        if pil_img is not None:
-                            ocr_text = pytesseract.image_to_string(pil_img)
-                            if ocr_text and len(ocr_text.strip()) > 0:
-                                text = ocr_text
-                                ocr_applied = True
-                                ocr_pages.append(idx)
-                    except Exception:
-                        pass
-
-                # Cap per-page text to avoid overlong logs/processing
+                    # Throttle OCR
+                    with self._ocr_semaphore:
+                        try:
+                            page_image = page.to_image(resolution=max(200, min(self.ocr_dpi, 300)))
+                            pil_img = getattr(page_image, "image", None)
+                            if pil_img is not None:
+                                # Optional downscale for speed
+                                if max(pil_img.size) > 1800:
+                                    factor = 1800.0 / float(max(pil_img.size))
+                                    new_size = (int(pil_img.size[0] * factor), int(pil_img.size[1] * factor))
+                                    pil_img = pil_img.resize(new_size)
+                                # Route OCR via ProcessPool for CPU isolation
+                                if self._ocr_pool is None:
+                                    self._ocr_pool = ProcessPoolExecutor(max_workers=max(1, int(getattr(config, "OCR_MAX_CONCURRENT", 2))))
+                                import io
+                                buf = io.BytesIO()
+                                pil_img.save(buf, format="PNG")
+                                fut = self._ocr_pool.submit(
+                                    _ocr_png_to_text,
+                                    buf.getvalue(),
+                                    str(getattr(config, "TESS_LANGS", "eng")),
+                                    int(getattr(config, "TESS_OEM", 1)),
+                                    int(getattr(config, "TESS_PSM", 6)),
+                                )
+                                ocr_text = fut.result()
+                                if ocr_text and len(ocr_text.strip()) > 0:
+                                    text = ocr_text
+                                    ocr_applied = True
+                        except Exception:
+                            pass
                 if len(text) > self.max_chars_per_page:
                     text = text[: self.max_chars_per_page]
-                page_texts.append(text)
-                page_tables.append(tables_norm)
-                image_based_pages.append(is_image_like)
-
-                # Lightweight page metadata
                 bbox = getattr(page, "bbox", None)
                 rotation = getattr(page, "rotation", 0)
-                page_meta.append({
+                meta = {
                     "width": bbox[2] - bbox[0] if bbox else None,
                     "height": bbox[3] - bbox[1] if bbox else None,
                     "rotation": rotation,
                     "has_images": has_images,
                     "tables_found": len(tables_norm),
+                    "tables_strategy": tables_strategy,
+                    "words_found": len(words),
                     "chars_count": len(text),
                     "ocr_applied": ocr_applied,
-                })
+                }
+                return idx, {
+                    "text": text,
+                    "tables": tables_norm,
+                    "words": words,
+                    "is_image_like": is_image_like,
+                    "meta": meta,
+                    "ocr_applied": ocr_applied,
+                }
+
+        with pdfplumber.open(BytesIO(content)) as pdf:
+            pages_count = len(pdf.pages)
+            if pages_count > self.max_pages:
+                self.logger.warning("pdf_pages_exceed_limit", extra={"extra": {"document_id": document_id, "pages": pages_count, "max_pages": self.max_pages}})
+                indices = list(range(0, self.max_pages))
+            else:
+                indices = list(range(0, pages_count))
+
+        # Parallel processing of pages
+        max_workers = max(1, int(getattr(config, "PDF_MAX_WORKERS", 4)))
+        results_map: Dict[int, Dict[str, object]] = {}
+        if max_workers == 1 or len(indices) == 1:
+            for i in indices:
+                idx, data = process_single_page(i)
+                results_map[idx] = data
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {executor.submit(process_single_page, i): i for i in indices}
+                for fut in as_completed(futures):
+                    idx, data = fut.result()
+                    results_map[idx] = data
+
+        for idx in sorted(results_map.keys()):
+            data = results_map[idx]
+            page_texts.append(data["text"])  # type: ignore[index]
+            page_tables.append(data["tables"])  # type: ignore[index]
+            page_words.append(data["words"])  # type: ignore[index]
+            image_based_pages.append(data["is_image_like"])  # type: ignore[index]
+            page_meta.append(data["meta"])  # type: ignore[index]
+            if data.get("ocr_applied"):
+                ocr_pages.append(idx)
 
         first_page_text = page_texts[0] if page_texts else ""
 
@@ -160,6 +285,7 @@ class PdfStatementProcessor:
             pages_count=pages_count if 'pages_count' in locals() else 0,
             page_texts=page_texts,
             page_tables=page_tables,
+            page_words=page_words,
             image_based_pages=image_based_pages,
             first_page_text=first_page_text,
             metadata=metadata,
@@ -305,8 +431,17 @@ class PdfStatementProcessor:
 
         normalized: List[Dict[str, object]] = []
 
+        metrics = {
+            "rows_from_tables": 0,
+            "rows_from_tokens": 0,
+            "rows_from_text": 0,
+            "pages_with_tables": 0,
+            "pages_with_tokens": 0,
+        }
+
         # Tables first
         for page_index, tables in enumerate(extracted.page_tables):
+            seq_counter = 0
             for table in tables:
                 if not table:
                     continue
@@ -323,7 +458,9 @@ class PdfStatementProcessor:
                         "currency": currency_hint,
                         "source": "table",
                         "page_index": page_index,
+                        "row_seq": seq_counter,
                     }
+                    seq_counter += 1
 
                     if header_map:
                         for col_index, canonical_name in header_map.items():
@@ -357,14 +494,123 @@ class PdfStatementProcessor:
                     # Basic validity: need at least description or amount
                     if row_dict["description"] or row_dict["amount"]:
                         normalized.append(row_dict)
+                        metrics["rows_from_tables"] += 1
+            if tables:
+                metrics["pages_with_tables"] += 1
+            # Early stop if we have enough rows overall
+            if getattr(config, "EARLY_STOP_MIN_ROWS", 0) > 0 and len(normalized) >= int(getattr(config, "EARLY_STOP_MIN_ROWS", 0)):
+                return normalized
 
-        # Text fallback for pages where no rows captured from tables
+        # Stream-mode reconstruction from word tokens (header-anchored) if tables yielded nothing
+        if not normalized and getattr(extracted, "page_words", None):
+            for page_index, words in enumerate(extracted.page_words):
+                if not words:
+                    continue
+                rows_tokens = words_to_rows(words)
+                if not rows_tokens:
+                    continue
+                # Find probable header row by token text matching
+                header_candidates = []
+                for r in rows_tokens[:8]:  # inspect first few rows for headers
+                    tokens_texts = [str(t.get("text", "")) for t in r.get("tokens", [])]
+                    canonical_hits = [self._standardize_header_token(x) for x in tokens_texts]
+                    if any(h in {"date", "description", "debit", "credit", "amount", "balance"} for h in canonical_hits if h):
+                        header_candidates.append(r)
+                header_row = header_candidates[0] if header_candidates else None
+                if header_row is None:
+                    continue
+                bands = infer_column_bands(header_row.get("tokens", []))
+                if not bands:
+                    continue
+                # Build header map from header tokens assigned to bands
+                header_cells_tokens = assign_tokens_to_columns(header_row.get("tokens", []), bands)
+                header_cells_text = [" ".join(t.get("text", "") for t in cell).strip() for cell in header_cells_tokens]
+                header_map = {}
+                for idx, token_text in enumerate(header_cells_text):
+                    canonical = self._standardize_header_token(token_text)
+                    if canonical:
+                        header_map[idx] = canonical
+
+                # Require minimal header
+                values = set(header_map.values())
+                if not ("date" in values and ("amount" in values or "debit" in values or "credit" in values or "description" in values)):
+                    header_map = {}
+
+                # Identify description column index for merge heuristic
+                description_col_index = None
+                for col_idx, name in header_map.items():
+                    if name == "description":
+                        description_col_index = col_idx
+                        break
+
+                # Process subsequent rows
+                seq_counter = 0
+                for r in rows_tokens[rows_tokens.index(header_row) + 1:]:
+                    row_tokens = r.get("tokens", [])
+                    if not row_tokens:
+                        continue
+                    col_tokens = assign_tokens_to_columns(row_tokens, bands)
+                    col_texts = [" ".join(t.get("text", "") for t in col).strip() for col in col_tokens]
+                    if not any(col_texts):
+                        continue
+                    row_dict: Dict[str, object] = {
+                        "date": None,
+                        "description": None,
+                        "debit": None,
+                        "credit": None,
+                        "amount": None,
+                        "balance": None,
+                        "currency": currency_hint,
+                        "source": "tokens",
+                        "page_index": page_index,
+                        "row_seq": seq_counter,
+                    }
+                    seq_counter += 1
+                    if header_map:
+                        for col_index, canonical_name in header_map.items():
+                            if col_index < len(col_texts):
+                                self._assign_cell_value(row_dict, canonical_name, col_texts[col_index], currency_hint)
+
+                    # Post-process amount sign from debit/credit if needed
+                    if row_dict["amount"] is None:
+                        debit = row_dict["debit"]
+                        credit = row_dict["credit"]
+                        if isinstance(debit, Decimal):
+                            row_dict["amount"] = Decimal(0) - debit
+                        elif isinstance(credit, Decimal):
+                            row_dict["amount"] = credit
+
+                    # Continuation row heuristic: no numbers/date, description present → merge with previous
+                    is_number_present = any(isinstance(row_dict[k], Decimal) for k in ("amount", "debit", "credit", "balance"))
+                    has_date = isinstance(row_dict["date"], date)
+                    if (not is_number_present and not has_date and isinstance(row_dict.get("description"), str) and (row_dict["description"] or "")):
+                        if normalized:
+                            prev = normalized[-1]
+                            if isinstance(prev.get("description"), str):
+                                # If we know the description column index, favor merge when that column has text
+                                if description_col_index is not None and description_col_index < len(col_texts):
+                                    desc_piece = col_texts[description_col_index]
+                                else:
+                                    desc_piece = row_dict.get("description") or ""
+                                combined = (prev["description"] + " " + str(desc_piece)).strip()
+                                prev["description"] = combined
+                                continue
+                    if row_dict["description"] or row_dict["amount"]:
+                        normalized.append(row_dict)
+                        metrics["rows_from_tokens"] += 1
+                if rows_tokens:
+                    metrics["pages_with_tokens"] += 1
+                if getattr(config, "EARLY_STOP_MIN_ROWS", 0) > 0 and len(normalized) >= int(getattr(config, "EARLY_STOP_MIN_ROWS", 0)):
+                    return normalized
+
+        # Text fallback for pages where no rows captured
         if not normalized:
             amount_token = r"(?:\(?-?\d{1,3}(?:[,\s]\d{3})*(?:\.\d{2})?\)?|\(?-?\d+(?:\.\d{2})?\)?)"
             date_token = r"\b(?:\d{1,2}[\-/]\d{1,2}[\-/]\d{2,4}|\d{4}[\-/]\d{1,2}[\-/]\d{1,2}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{2,4})\b"
             line_re = re.compile(rf"(?P<date>{date_token}).{{1,80}}?(?P<amount>{amount_token})(?:\s+(?P<balance>{amount_token}))?", re.IGNORECASE)
 
             for page_index, text in enumerate(extracted.page_texts):
+                seq_counter = 0
                 for raw_line in (text or "").splitlines():
                     line = raw_line.strip()
                     if not line:
@@ -398,9 +644,58 @@ class PdfStatementProcessor:
                         "currency": currency_hint,
                         "source": "text",
                         "page_index": page_index,
+                        "row_seq": seq_counter,
                     })
+                    seq_counter += 1
+                    metrics["rows_from_text"] += 1
+                    if getattr(config, "EARLY_STOP_MIN_ROWS", 0) > 0 and len(normalized) >= int(getattr(config, "EARLY_STOP_MIN_ROWS", 0)):
+                        return normalized
 
+        # Attach metrics into metadata for downstream quality gates
+        try:
+            extracted.metadata.setdefault("metrics", {})  # type: ignore[index]
+            extracted.metadata["metrics"].update(metrics)  # type: ignore[index]
+        except Exception:
+            pass
         return normalized
+
+    # -------------------------- balances detection --------------------------
+    def _detect_balances_from_text(self, texts: List[str], currency_hint: Optional[str]) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        opening: Optional[Decimal] = None
+        closing: Optional[Decimal] = None
+        if not texts:
+            return opening, closing
+        # Search likely opening on early pages, closing on later pages
+        head_text = "\n".join(texts[: min(2, len(texts))])
+        tail_text = "\n".join(texts[max(0, len(texts) - 2):])
+
+        def find_amount(patterns: List[str], hay: str) -> Optional[Decimal]:
+            for pat in patterns:
+                try:
+                    m = re.search(pat, hay, flags=re.IGNORECASE)
+                except re.error:
+                    m = None
+                if m:
+                    amt_txt = m.group(1)
+                    amt = self._parse_amount(amt_txt, currency_hint)
+                    if isinstance(amt, Decimal):
+                        return amt
+            return None
+
+        opening_patterns = [
+            r"opening\s*balance[:\s-]*([^\n]+)",
+            r"balance\s*brought\s*forward[:\s-]*([^\n]+)",
+            r"start(?:ing)?\s*balance[:\s-]*([^\n]+)",
+        ]
+        closing_patterns = [
+            r"closing\s*balance[:\s-]*([^\n]+)",
+            r"balance\s*carried\s*forward[:\s-]*([^\n]+)",
+            r"end(?:ing)?\s*balance[:\s-]*([^\n]+)",
+        ]
+
+        opening = find_amount(opening_patterns, head_text)
+        closing = find_amount(closing_patterns, tail_text)
+        return opening, closing
 
     # -------------------------- helpers --------------------------
     def _detect_header_mapping(self, header_row: List[str]) -> Dict[int, str]:
@@ -531,6 +826,16 @@ class PdfStatementProcessor:
             return dt.date()
         except Exception:
             pass
+        try:
+            dt = datetime.strptime(s, "%d %b %Y")
+            return dt.date()
+        except Exception:
+            pass
+        try:
+            dt = datetime.strptime(s, "%d %b, %Y")
+            return dt.date()
+        except Exception:
+            pass
 
         for fmt in candidates:
             try:
@@ -560,18 +865,48 @@ class PdfStatementProcessor:
             # CR shouldn’t override explicit negatives; only set positive if nothing else indicates negative
             is_negative = is_negative and True or False
 
-        # Remove currency symbols and non-numeric separators
-        s_clean = s
-        s_clean = re.sub(r"[A-Za-z₦$€£₹]", "", s_clean)
-        s_clean = s_clean.replace(",", "").replace(" ", "")
-        s_clean = s_clean.replace("(", "").replace(")", "")
-        s_clean = s_clean.strip()
-        if s_clean in ("", "-", "."):
-            return None
-        try:
-            value = Decimal(s_clean)
-        except (InvalidOperation, ValueError):
-            return None
+        # Locale-aware parsing with Babel when available; fallback to legacy
+        value: Optional[Decimal] = None
+        s_wo_ccy = re.sub(r"[A-Za-z₦$€£₹]", "", s)
+        if _HAVE_BABEL:
+            # Heuristics: detect separators by pattern
+            # Examples: 1.234,56 → decimal="," grouping="." ; 1,234.56 → decimal="." grouping="," ; 1 234,56 thin space
+            candidate_strings = []
+            # remove parentheses/spaces for parsing
+            candidate_strings.append(re.sub(r"[()\s]", "", s_wo_ccy))
+            for cand in candidate_strings:
+                try:
+                    # Try common locales implicitly by replacing separators
+                    if re.search(r"\d+\.\d{3},\d{2}$", cand) or ("," in cand and "." in cand and cand.rfind(",") > cand.rfind(".")):
+                        # likely EU style
+                        normalized = cand.replace(".", "").replace(",", ".")
+                        value = Decimal(normalized)
+                        break
+                    if re.search(r"\d+,\d{3}\.\d{2}$", cand) or ("," in cand and "." in cand and cand.rfind(".") > cand.rfind(",")):
+                        # likely US style
+                        normalized = cand.replace(",", "")
+                        value = Decimal(normalized)
+                        break
+                    # Fallback: single separator is decimal
+                    if cand.count(",") == 1 and "." not in cand:
+                        value = Decimal(cand.replace(",", "."))
+                        break
+                    if cand.count(".") == 1 and "," not in cand:
+                        value = Decimal(cand)
+                        break
+                except Exception:
+                    value = None
+        if value is None:
+            # Remove currency symbols and non-numeric separators
+            s_clean = s_wo_ccy.replace(",", "").replace(" ", "")
+            s_clean = s_clean.replace("(", "").replace(")", "")
+            s_clean = s_clean.strip()
+            if s_clean in ("", "-", "."):
+                return None
+            try:
+                value = Decimal(s_clean)
+            except (InvalidOperation, ValueError):
+                return None
         if is_negative:
             value = Decimal(0) - value
         return value
@@ -667,6 +1002,7 @@ class PdfStatementProcessor:
                 "balance": balance,
                 "currency": currency,
                 "page_index": page_index,
+                "row_seq": row.get("row_seq") if isinstance(row.get("row_seq"), int) else None,
                 "raw": row,
             })
 
@@ -734,15 +1070,16 @@ class PdfStatementProcessor:
                 t_copy["amount"] = amount
             normalized_txns.append(t_copy)
 
-        # Sort by (date, page_index, description) for deterministic ordering
-        def sort_key(t: Dict[str, object]) -> Tuple[str, int, str]:
+        # Sort by (date, page_index, row_seq, description) for deterministic ordering
+        def sort_key(t: Dict[str, object]) -> Tuple[str, int, int, str]:
             date_part = ""  # empty sorts first
             d = t.get("date")
             if isinstance(d, date):
                 date_part = d.isoformat()
             page_part = t.get("page_index") if isinstance(t.get("page_index"), int) else -1
+            row_seq = t.get("row_seq") if isinstance(t.get("row_seq"), int) else -1
             descr = t.get("description") if isinstance(t.get("description"), str) else ""
-            return (date_part, page_part, descr)
+            return (date_part, page_part, row_seq, descr)
 
         normalized_txns.sort(key=sort_key)
 
@@ -852,22 +1189,59 @@ class PdfStatementProcessor:
     # ---------------------------------------------
     # PII masking stage
     # ---------------------------------------------
-    def mask_pii(self, transactions: List[Dict[str, object]]) -> List[Dict[str, object]]:
-        """
-        Deterministically redact sensitive tokens in string fields (descriptions and raw).
-        Keeps last 4 digits where safe and replaces the rest with a stable token.
-        """
-        masked: List[Dict[str, object]] = []
+
+    def _stringify_obj(self, obj):
+        if obj is None:
+            return ""
+        if isinstance(obj, str):
+            return obj
+        from decimal import Decimal
+        if isinstance(obj, Decimal):
+            return str(obj)
+        if isinstance(obj, (int, float, bool)):
+            return str(obj)
+        if isinstance(obj, list):
+            return [self._stringify_obj(x) for x in obj]
+        if isinstance(obj, dict):
+            out = {}
+            for k, v in obj.items():
+                out[str(k)] = self._stringify_obj(v)
+            return out
+        return str(obj)
+
+
+    # def mask_pii(self, transactions: List[Dict[str, object]]) -> List[Dict[str, object]]:
+    #     """
+    #     Deterministically redact sensitive tokens in string fields (descriptions and raw).
+    #     Keeps last 4 digits where safe and replaces the rest with a stable token.
+    #     Masking is conservative by default: only account-like numbers unless configured otherwise.
+    #     """
+    #     masked: List[Dict[str, object]] = []
+    #     for t in transactions:
+    #         t_copy = dict(t)
+    #         # Never mask numeric fields like debit/credit/amount unless explicitly enabled
+    #         if not self.mask_amounts:
+    #             # ensure numeric fields stay as-is
+    #             pass
+    #         # Mask top-level description
+    #         if isinstance(t_copy.get("description"), str):
+    #             t_copy["description"] = self._mask_pii_text(t_copy["description"])  # type: ignore[index]
+    #         # Mask recursively in raw
+    #         t_copy["raw"] = self._mask_in_obj(t_copy.get("raw"))
+    #         masked.append(t_copy)
+    #     return masked
+
+    def mask_pii(self, transactions):
+        masked = []
         for t in transactions:
             t_copy = dict(t)
-            # Mask top-level description
             if isinstance(t_copy.get("description"), str):
-                t_copy["description"] = self._mask_pii_text(t_copy["description"])  # type: ignore[index]
-            # Mask recursively in raw
-            t_copy["raw"] = self._mask_in_obj(t_copy.get("raw"))
+                t_copy["description"] = self._mask_pii_text(t_copy["description"])
+            masked_raw = self._mask_in_obj(t_copy.get("raw"))
+            t_copy["raw"] = self._stringify_obj(masked_raw)  # <-- stringify leaves
             masked.append(t_copy)
         return masked
-
+    
     def _mask_in_obj(self, obj):  # type: ignore[no-untyped-def]
         if obj is None:
             return None
@@ -898,18 +1272,22 @@ class PdfStatementProcessor:
             if 13 <= len(digits) <= 19 and self._luhn_check(digits):
                 return self._deterministic_token("CARD", digits, keep_last=4)
             return raw
-        s = re.sub(r"\b(?:\d[ -]?){13,19}\b", _sub_pan, s)
+        # Only apply PAN masking if not restricted to account-only
+        if not self.mask_account_like_numbers_only:
+            s = re.sub(r"\b(?:\d[ -]?){13,19}\b", _sub_pan, s)
 
         # BVN (Nigeria 11 digits)
         def _sub_bvn(m: re.Match) -> str:
             digits = m.group(0)
             return self._deterministic_token("BVN", digits, keep_last=2)
-        s = re.sub(r"\b\d{11}\b", _sub_bvn, s)
+        if not self.mask_account_like_numbers_only:
+            s = re.sub(r"\b\d{11}\b", _sub_bvn, s)
 
         # Sort code (UK xx-xx-xx)
         def _sub_sort(m: re.Match) -> str:
             return self._deterministic_token("SORT", m.group(0).replace("-", ""), keep_last=2)
-        s = re.sub(r"\b\d{2}-\d{2}-\d{2}\b", _sub_sort, s)
+        if not self.mask_account_like_numbers_only:
+            s = re.sub(r"\b\d{2}-\d{2}-\d{2}\b", _sub_sort, s)
 
         # Account numbers (NUBAN 10 digits; also 8-12 generic when preceded by keywords)
         def _sub_acct(m: re.Match) -> str:
@@ -925,12 +1303,14 @@ class PdfStatementProcessor:
             if len(digits) == 9:
                 return self._deterministic_token("ROUTING", digits, keep_last=2)
             return m.group(0)
-        s = re.sub(r"routing\s*number[:\s-]*([0-9\-\s]{9,})", _sub_routing, s, flags=re.IGNORECASE)
+        if not self.mask_account_like_numbers_only:
+            s = re.sub(r"routing\s*number[:\s-]*([0-9\-\s]{9,})", _sub_routing, s, flags=re.IGNORECASE)
 
         # Email addresses
         def _sub_email(m: re.Match) -> str:
             return self._deterministic_token("EMAIL", m.group(0), keep_last=0)
-        s = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", _sub_email, s)
+        if not self.mask_account_like_numbers_only:
+            s = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", _sub_email, s)
 
         return s
 
@@ -1008,6 +1388,12 @@ class PdfStatementProcessor:
         #get transactions in the pdf 
         txns = self.parse_transactions(rows, document_id=extracted.document_id, account_id=account_id)
 
+        # If balances not provided, attempt detection from statement text
+        if opening_balance is None or closing_balance is None:
+            auto_open, auto_close = self._detect_balances_from_text(extracted.page_texts, fingerprint.get("currency") if isinstance(fingerprint, dict) else None)
+            opening_balance = opening_balance if isinstance(opening_balance, Decimal) else auto_open
+            closing_balance = closing_balance if isinstance(closing_balance, Decimal) else auto_close
+
         # Validate and give these transactions a standardized structure
         validated_txns, summary = self.validate_statement(txns, opening_balance, closing_balance, drop_duplicates)
 
@@ -1023,23 +1409,62 @@ class PdfStatementProcessor:
             "validation": summary,
             "transactions": masked_txns,
         }
+        # Expose OCR info for upstream analysis
+        try:
+            result["ocr"] = extracted.metadata.get("ocr")  # type: ignore[assignment]
+        except Exception:
+            pass
+        # Surface extraction metrics for alerts and dashboards
+        try:
+            metrics = extracted.metadata.get("metrics") if isinstance(extracted.metadata, dict) else None
+            if isinstance(metrics, dict):
+                result["metrics"] = metrics
+        except Exception:
+            pass
         # Persist artifacts and result for replay/debug
         if self.storage is not None and hasattr(self.storage, "persist"):
             try:
                 artifacts = {
                     "pages_count": extracted.pages_count,
-                    "page_texts": extracted.page_texts,
                     "page_tables": extracted.page_tables,
                     "image_based_pages": extracted.image_based_pages,
                     "first_page_text": extracted.first_page_text,
                     "metadata": extracted.metadata,
                 }
+                if getattr(config, "ARTIFACTS_INCLUDE_TEXTS", False):
+                    artifacts["page_texts"] = extracted.page_texts
+                if getattr(config, "ARTIFACTS_INCLUDE_WORDS", False):
+                    artifacts["page_words"] = extracted.page_words
+                # Optional debug overlays
+                overlays: Dict[str, bytes] = {}
+                if getattr(config, "DEBUG_OVERLAY_ENABLED", False):
+                    max_pages = min(int(getattr(config, "DEBUG_OVERLAY_MAX_PAGES", 5)), extracted.pages_count)
+                    for i in range(max_pages):
+                        try:
+                            # Best-effort render with words; column bands unavailable post-normalization, so omit here
+                            img = render_page_overlay(content, i, words=extracted.page_words[i] if i < len(extracted.page_words) else None)
+                            buf = BytesIO()
+                            img.save(buf, format="PNG")
+                            overlays[f"overlay_page_{i+1}.png"] = buf.getvalue()
+                        except Exception:
+                            continue
                 self.storage.persist(
                     extracted.document_id,
                     artifacts=artifacts,
                     result=result,
                     raw_pdf=content,
                 )
+                # Store overlays as separate files if any
+                if overlays:
+                    try:
+                        st = self.storage if hasattr(self.storage, "_doc_dir") else ArtifactStorage()
+                        doc_dir = st._doc_dir(extracted.document_id)
+                        import os
+                        for name, data in overlays.items():
+                            with open(os.path.join(doc_dir, name), "wb") as f:
+                                f.write(data)
+                    except Exception:
+                        pass
                 self.logger.info("pdf_persisted", extra={"extra": {"document_id": extracted.document_id}})
             except Exception:
                 pass

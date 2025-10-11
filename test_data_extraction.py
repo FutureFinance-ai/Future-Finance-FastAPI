@@ -1,5 +1,5 @@
 from pathlib import Path
-from services.data_service import DataService  # make sure this has process_pdf_with_plumber
+from pdf.data_service import DataService  # make sure this has process_pdf_with_plumber
 import pdfplumber
 from schemas.UploadData import DocumentUploadResponse
 
@@ -34,10 +34,26 @@ def main():
 
     # === Run the new processor ===
     doc = service.process_pdf(content, filename=Path(pdf_path).name)
-    doc["metadata"]["doc_url"] = "AWS/save/here"
-    # result = service.parse_variable_to_transaction_dict(doc)
-    print(DocumentUploadResponse(num_transactions=doc["metadata"]["num_transactions"], filename=doc["metadata"]["filename"], doc_url=doc["metadata"]["doc_url"]))
-    print(doc)
+    # Set metadata fields using dot access
+    if doc.metadata is None:
+        doc.metadata = {}
+    doc.metadata["doc_url"] = "AWS/save/here"
+    doc.metadata["filename"] = str(Path(pdf_path).name)
+    doc.metadata["num_transactions"] = str(len(doc.transactions))
+
+    # Build the response using required fields from the schema
+    resp = DocumentUploadResponse(
+        account_name=str(doc.account_id or ""),
+        account_number=str(doc.account_id or ""),
+        total_credit=float(doc.total_credits),
+        total_debit=float(doc.total_debits),
+        opening_balance=float(doc.opening_balance),
+        closing_balance=float(doc.closing_balance),
+        number_of_transactions=int(len(doc.transactions)),
+        url=doc.metadata.get("doc_url", ""),
+        filename=doc.metadata.get("filename", str(Path(pdf_path).name)),
+    )
+    print(resp)
 
     # print("\n=== Parsed Document ===")
     # # print(f"Account ID: {doc.account_id}")
