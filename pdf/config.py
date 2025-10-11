@@ -17,6 +17,14 @@ def getenv_int(name: str, default: int) -> int:
         return default
 
 
+def getenv_float(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v) if v is not None else default
+    except Exception:
+        return default
+
+
 def getenv_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
@@ -38,6 +46,36 @@ OCR_DPI = getenv_int("FF_OCR_DPI", 300)
 
 MAX_PAGES = getenv_int("FF_MAX_PAGES", 200)
 MAX_CHARS_PER_PAGE = getenv_int("FF_MAX_CHARS_PER_PAGE", 20000)
+
+# Parallelism
+PDF_MAX_WORKERS = getenv_int("FF_PDF_MAX_WORKERS", __import__("os").cpu_count() or 4)
+USE_FITZ_FASTPATH = getenv_bool("FF_USE_FITZ_FASTPATH", False)
+
+# PII masking controls
+PII_MASK_ACCOUNT_ONLY = getenv_bool("FF_PII_MASK_ACCOUNT_ONLY", True)
+PII_MASK_AMOUNTS = getenv_bool("FF_PII_MASK_AMOUNTS", False)
+
+# Debug overlays
+DEBUG_OVERLAY_ENABLED = getenv_bool("FF_DEBUG_OVERLAY_ENABLED", False)
+DEBUG_OVERLAY_MAX_PAGES = getenv_int("FF_DEBUG_OVERLAY_MAX_PAGES", 5)
+
+# OCR throttling and tuning
+OCR_MAX_CONCURRENT = getenv_int("FF_OCR_MAX_CONCURRENT", 2)
+TESS_LANGS = getenv_str("FF_TESS_LANGS", "eng")
+TESS_OEM = getenv_int("FF_TESS_OEM", 1)
+TESS_PSM = getenv_int("FF_TESS_PSM", 6)
+
+# Artifact storage controls
+ARTIFACTS_GZIP = getenv_bool("FF_ARTIFACTS_GZIP", False)
+ARTIFACTS_INCLUDE_TEXTS = getenv_bool("FF_ARTIFACTS_INCLUDE_TEXTS", False)
+ARTIFACTS_INCLUDE_WORDS = getenv_bool("FF_ARTIFACTS_INCLUDE_WORDS", False)
+
+# Early stop controls
+EARLY_STOP_MIN_ROWS = getenv_int("FF_EARLY_STOP_MIN_ROWS", 0)
+
+# Metrics alerts
+METRICS_ALERT_TOKENS_DOMINATE = getenv_bool("FF_METRICS_ALERT_TOKENS_DOMINATE", True)
+METRICS_TOKENS_DOMINATE_RATIO = getenv_str("FF_METRICS_TOKENS_DOMINATE_RATIO", "0.6")
 
 
 # --- Runtime / API settings ---

@@ -1,0 +1,15 @@
+**Events 
+on_sign_up should trigger email verification
+
+
+
+**PDF Parsing
+Improved PDF parsing for storage 
+
+
+
+** AWS 
+setup S3 bucket to store PDF
+
+** Docker 
+setup docker image

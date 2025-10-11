@@ -11,8 +11,8 @@ import json
 
 # Import your schema dataclasses (assumed to exist)
 from schemas.UploadData import CleanedStatementDocument
-from services.pdf_statement_processor import PdfStatementProcessor
-from services.artifact_storage import ArtifactStorage
+from pdf.pdf_statement_processor import PdfStatementProcessor
+from pdf.artifact_storage import ArtifactStorage
 
 
 class DataService:
@@ -68,17 +68,70 @@ class DataService:
 
         return s
 
-    def _sanitize_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
-        """Apply masking to all string values in a row dict."""
-        sanitized: Dict[str, Any] = {}
+    def _sanitize_row(self, row: Dict[str, Any]) -> Dict[str, str]:
+        """Mask and stringify all values so that raw conforms to Dict[str, str]."""
+        def to_string(val: Any) -> str:
+            if val is None:
+                return ""
+            # datetime/date
+            if hasattr(val, "isoformat"):
+                try:
+                    return val.isoformat()
+                except Exception:
+                    pass
+            # numbers / bools
+            if isinstance(val, (int, float, bool)):
+                return str(val)
+            # bytes
+            if isinstance(val, (bytes, bytearray)):
+                try:
+                    return val.decode("utf-8", errors="ignore")
+                except Exception:
+                    return str(val)
+            # lists/dicts -> compact string repr
+            if isinstance(val, (list, dict)):
+                try:
+                    import json as _json
+                    return _json.dumps(val, ensure_ascii=False)
+                except Exception:
+                    return str(val)
+            return str(val)
+
+        sanitized: Dict[str, str] = {}
         for k, v in row.items():
-            if v is None:
-                sanitized[k] = None
-            elif isinstance(v, (int, float, bool)):
-                sanitized[k] = v
-            else:
-                sanitized[k] = self._mask_sensitive(str(v))
+            sanitized[k] = self._mask_sensitive(to_string(v)) or ""
         return sanitized
+
+    def _coerce_date(self, tx: Dict[str, Any]) -> Optional[datetime.date]:
+        """Best-effort to return a valid date for a transaction; None if unavailable."""
+        # 1) Direct date/datetime
+        dval = tx.get("date")
+        if dval is not None:
+            try:
+                if isinstance(dval, datetime):
+                    return dval.date()
+                # date-like with isoformat
+                if hasattr(dval, "isoformat") and not isinstance(dval, str):
+                    return dval  # type: ignore[return-value]
+                # string → parse
+                d = pd.to_datetime(str(dval), errors="coerce")
+                if d is not None and not pd.isna(d):
+                    return d.date()
+            except Exception:
+                pass
+        # 2) Look into raw fields for candidates
+        raw = tx.get("raw") if isinstance(tx, dict) else None
+        if isinstance(raw, dict):
+            for key in ("date", "value_date", "trans_time"):
+                try:
+                    candidate = raw.get(key)
+                    if candidate:
+                        d = pd.to_datetime(str(candidate), errors="coerce")
+                        if d is not None and not pd.isna(d):
+                            return d.date()
+                except Exception:
+                    continue
+        return None
 
     # ----------------------------
     # Column / schema helpers (Excel)
@@ -621,6 +674,10 @@ class DataService:
         total_credits = 0.0
         total_debits = 0.0
         for t in result.get("transactions", []):
+            # Ensure a valid date or skip the transaction to satisfy schema
+            t_date = self._coerce_date(t)
+            if t_date is None:
+                continue
             desc_raw = str(t.get("description") or "")
             amt = t.get("amount")
             amt_float: Optional[float] = None
@@ -638,7 +695,7 @@ class DataService:
 
             category, subcategory = self._categorize(desc_raw, abs(amt_float or 0.0), txn_type)
             categorized.append({
-                "date": t.get("date"),
+                "date": t_date,
                 "description": self._mask_sensitive(desc_raw),
                 "amount": round(float(abs(amt_float or 0.0)), 2),
                 "type": txn_type,
