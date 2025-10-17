@@ -1,12 +1,15 @@
 from fastapi import Depends, Request
 from fastapi_users import BaseUserManager
 from typing import Optional
+import logging
 
 from auth.db import get_user_db
 from .config import settings
 
 from .models import User
 from users.user_repo import SurrealUserDatabase
+
+logger = logging.getLogger(__name__)
 
 
 class UserManager(BaseUserManager[User, str]):
@@ -19,7 +22,7 @@ class UserManager(BaseUserManager[User, str]):
         return value
 
     async def on_after_register(self, user: User, request: Optional[Request] = None):
-        print(f"User {user.email} has registered. Triggering email verification.")  # at least log something
+        logger.info(f"User {user.email} has registered. Triggering email verification.")  # at least log something
 
 
 async def get_user_manager(user_db: SurrealUserDatabase = Depends(get_user_db)) -> UserManager:
