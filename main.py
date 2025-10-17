@@ -1,20 +1,19 @@
 from typing import Dict
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, status
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from schemas.UploadData import DocumentUploadResponse
-from services.statement_service import StatementService
 # from services.config import IS_DEV, CORS_ALLOW_ORIGINS, CORS_ALLOW_CREDENTIALS
 from auth.routes import router as auth_router
+from upload_service.upload_route import router as upload_router
 from auth.db import init_db, close_db
+import logging
 
-
-statement_service = StatementService()
+logger = logging.getLogger(__name__)
 
 
 def get_app() -> FastAPI:
+    logger.info("Starting FutureFinance API")
     app = FastAPI(title="FutureFinance API")
 
     # CORS: enable permissive defaults for local development
@@ -29,33 +28,28 @@ def get_app() -> FastAPI:
     # DB lifecycle
     @app.on_event("startup")
     async def on_startup() -> None:
+        logger.info("Initializing database")
         await init_db()
 
     @app.on_event("shutdown")
     async def on_shutdown() -> None:
+        logger.info("Closing database")
         await close_db()
 
     # Routers
     app.include_router(auth_router)
+    app.include_router(upload_router)
+    logger.info("Routers initialized successfully")
 
     # Health
     @app.get("/health")
     async def health_check() -> Dict[str, str]:
+        logger.info("Health check")
         return {"status": "ok"}
 
     # Upload endpoint
-    @app.post("/upload-bank-statement", response_model=DocumentUploadResponse)
-    async def upload_bank_statement(
-        file: UploadFile = File(...),
-    ) -> DocumentUploadResponse:
-        try:
-            return await statement_service.upload_pdf_bank_statement(file)
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=str(e),
-            )
-
+    
+    logger.info("API started")
     return app
 
 
