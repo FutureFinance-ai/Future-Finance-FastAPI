@@ -1,20 +1,15 @@
 
 
 from fastapi import UploadFile, HTTPException, status
+from analysis_service.analysis_service import AnalysisService, get_analysis_service
+
 
 import os
 
 
 class UploadService:
-    def __init__(self):
-        self.SUPPORTED_MIME_TYPES = {
-            "application/pdf": "pdf",
-            "text/csv": "csv",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",  # .xlsx
-            "application/vnd.ms-excel": "xls",  # .xls
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",  # .docx
-            # Note: Use file.content_type for reliable checks, not just extensions.
-        }
+    def __init__(self, analysis_service: AnalysisService | None = None):
+        self.analysis_service = analysis_service or get_analysis_service()
 
     async def upload_document(self, db, file: UploadFile):
 
@@ -24,27 +19,45 @@ class UploadService:
       if doc_type == "pdf":
           try:
               data = await self.extract_financial_data_llm(pdf_file_bytes)
-              return data
+              # Convert to strict DataFrame structure
+              df = await self.analysis_service.transactions_to_dataframe(data)
+              # Return normalized JSON for API clients
+              normalized = {
+                "account_name": data.get("account_name", ""),
+                "account_number": data.get("account_number", ""),
+                "opening_balance": float(data.get("opening_balance", 0.0) or 0.0),
+                "closing_balance": float(data.get("closing_balance", 0.0) or 0.0),
+                "transactions": df.to_dict(orient="records"),
+              }
+              return normalized
           except Exception as e:
               raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error extracting financial data: {e}")
       else:
           raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unsupported file type: {doc_type}")
 
     async def process_uploaded_file_check(self, file: UploadFile):
-        content_type = file.content_type or "application/octet-stream"
-        file_handler_key = self.SUPPORTED_MIME_TYPES.get(content_type)
+      SUPPORTED_MIME_TYPES = {
+            "application/pdf": "pdf",
+            "text/csv": "csv",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",  # .xlsx
+            "application/vnd.ms-excel": "xls",  # .xls
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",  # .docx
+            # Note: Use file.content_type for reliable checks, not just extensions.
+        }
+      content_type = file.content_type or "application/octet-stream"
+      file_handler_key = SUPPORTED_MIME_TYPES.get(content_type)
 
-        if file_handler_key is None:
-            _, ext = os.path.splitext(file.filename)
-            ext = ext.lower().lstrip('.')
-            if ext in ["pdf", "csv", "xlsx", "xls", "docx"]:
-                file_handler_key = ext
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                    detail=f"Unsupported file type or MIME type: {content_type} / {ext}"
-                )
-        return file_handler_key
+      if file_handler_key is None:
+          _, ext = os.path.splitext(file.filename)
+          ext = ext.lower().lstrip('.')
+          if ext in ["pdf", "csv", "xlsx", "xls", "docx"]:
+              file_handler_key = ext
+          else:
+              raise HTTPException(
+                  status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                  detail=f"Unsupported file type or MIME type: {content_type} / {ext}"
+              )
+      return file_handler_key
 
     async def extract_financial_data_llm(self, pdf_file_bytes: bytes) -> dict:
       """

@@ -8,6 +8,8 @@ from surrealdb import AsyncSurreal
 from auth.models import User
 
 
+logger = logging.getLogger(__name__)
+
 class SurrealUserDatabase(BaseUserDatabase[User, str]):
     def __init__(self, db: AsyncSurreal, collection: str = "users") -> None:
         self.db = db
@@ -30,21 +32,19 @@ class SurrealUserDatabase(BaseUserDatabase[User, str]):
             raise HTTPException(status_code=500, detail=f"Error querying user by id: {exc}")
 
     async def get_by_email(self, email: str) -> Optional[User]:
-        logger = logging.getLogger(__name__)
         try:
             query = f"SELECT * FROM {self.collection} WHERE email = $email"
             vars = {"email": email}
             results = await self.db.query(query, vars)
 
-            # surrealdb-py returns a list of QueryResult objects; normalize accordingly
             if results and results[0]:
                 user = User(**self._normalize_record(results[0]))
                 return user
             return None
         except Exception as exc:
-            # raise HTTPException(status_code=500, detail="Error querying user by email")
             logger.exception("Error querying user by email from collection '%s': %s", self.collection, exc)
-            return None
+            raise HTTPException(status_code=500, detail="Error querying user by email")
+            
 
     async def create(self, create_dict: dict) -> User:
         now_iso = datetime.now(timezone.utc).isoformat()

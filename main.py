@@ -6,8 +6,12 @@ from fastapi.middleware.cors import CORSMiddleware
 # from services.config import IS_DEV, CORS_ALLOW_ORIGINS, CORS_ALLOW_CREDENTIALS
 from auth.routes import router as auth_router
 from upload_service.upload_route import router as upload_router
+from analysis_service.analysis_routes import router as analysis_router
 from auth.db import init_db, close_db
 import logging
+from config.config import settings
+from budgets.budget_routes import router as budget_router
+from alerts.alerts_routes import router as alerts_router
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +43,10 @@ def get_app() -> FastAPI:
     # Routers
     app.include_router(auth_router)
     app.include_router(upload_router)
+    app.include_router(analysis_router)
+    app.include_router(alerts_router)
+    if settings.ENABLE_BUDGETS:
+        app.include_router(budget_router)
     logger.info("Routers initialized successfully")
 
     # Health

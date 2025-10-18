@@ -21,4 +21,14 @@ class Settings(BaseSettings):
     ENV_RESET_PASSWORD_TOKEN_SECRET: str
     ENV_VERIFICATION_TOKEN_SECRET: str
 
+    # Feature flags
+    ENABLE_BUDGETS: bool = False
+
+    # SMTP / Alerts
+    SMTP_HOST: str | None = None
+    SMTP_PORT: int | None = None
+    SMTP_USER: str | None = None
+    SMTP_PASS: str | None = None
+    ALERTS_FROM_EMAIL: str | None = None
+
 settings = Settings() 
