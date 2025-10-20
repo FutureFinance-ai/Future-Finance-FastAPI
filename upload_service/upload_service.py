@@ -2,6 +2,10 @@
 
 from fastapi import UploadFile, HTTPException, status
 from analysis_service.analysis_service import AnalysisService, get_analysis_service
+from upload_service.models import AccountHeader, TransactionIn
+from upload_service.upload_repo import UploadRepo
+from storage.s3_client import S3Client
+import json
 
 
 import os
@@ -11,7 +15,7 @@ class UploadService:
     def __init__(self, analysis_service: AnalysisService | None = None):
         self.analysis_service = analysis_service or get_analysis_service()
 
-    async def upload_document(self, db, file: UploadFile):
+    async def upload_document(self, db, file: UploadFile, user_id: str):
 
       pdf_file_bytes = await file.read()
       doc_type = await self.process_uploaded_file_check(file)
@@ -19,17 +23,35 @@ class UploadService:
       if doc_type == "pdf":
           try:
               data = await self.extract_financial_data_llm(pdf_file_bytes)
-              # Convert to strict DataFrame structure
-              df = await self.analysis_service.transactions_to_dataframe(data)
-              # Return normalized JSON for API clients
-              normalized = {
-                "account_name": data.get("account_name", ""),
-                "account_number": data.get("account_number", ""),
-                "opening_balance": float(data.get("opening_balance", 0.0) or 0.0),
-                "closing_balance": float(data.get("closing_balance", 0.0) or 0.0),
-                "transactions": df.to_dict(orient="records"),
-              }
-              return normalized
+              # Upload raw JSON to S3 (cold storage)
+              
+              raw_json_str = json.dumps(data)
+              s3_key = f"statements/{file.filename}.json"
+              s3_url = await S3Client().put_text(bucket="${S3_BUCKET_RAW_JSON}", key=s3_key, text=raw_json_str)
+              # Enqueue background job (scaffold)
+              # Persist immediately with bulk insert for now
+              header = AccountHeader(
+                  account_name=data.get("account_name", ""),
+                  account_number=data.get("account_number", ""),
+                  opening_balance=float(data.get("opening_balance", 0.0) or 0.0),
+                  closing_balance=float(data.get("closing_balance", 0.0) or 0.0),
+              )
+              txns = [
+                  TransactionIn(
+                      trans_time=tx.get("trans_time") or tx.get("transaction_date"),
+                      value_date=tx.get("value_date") or tx.get("transaction_date"),
+                      description=tx.get("description") or tx.get("transaction_description", ""),
+                      debit=tx.get("debit", 0.0),
+                      credit=tx.get("credit", 0.0),
+                      balance=tx.get("balance"),
+                  )
+                  for tx in data.get("transactions", [])
+              ]
+              await UploadRepo(db).save_user_upload(user_id="current", account_header=header, transactions=txns, s3_url=s3_url)
+              job_id = "queued"
+              
+              # Optionally return immediate accepted response
+              return {"status": "accepted", "raw_json_url": s3_url, "job_id": job_id}
           except Exception as e:
               raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error extracting financial data: {e}")
       else:
@@ -131,7 +153,9 @@ class UploadService:
       # return json.loads(response.text)
 
       # Since we can't execute the API call, we return the structured logic
+
+    #   TODO: When we recieve json from llm, we save it in an aws bucket, and return the url. A copy can also be saved in the db? 
       return {
-          "status": "Awaiting LLM API Execution"
+          "returns": "json",
       }
 

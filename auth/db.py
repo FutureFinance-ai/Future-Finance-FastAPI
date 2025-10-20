@@ -4,6 +4,7 @@ from fastapi import Depends
 from surrealdb import AsyncSurreal
 from users.user_repo import SurrealUserDatabase
 from .config import settings
+import pathlib
 
 
 
@@ -29,6 +30,16 @@ async def init_db():
         # test_result = await db.query("INFO FOR DB")
     except Exception as e:
         raise Exception(f"Error initializing app database connection. Check your credentials: {e}") from e
+
+    # Load schema once on startup (idempotent DEFINE statements)
+    try:
+        schema_path = pathlib.Path(__file__).resolve().parents[1] / "settings" / "surreal" / "schema.surql"
+        with open(schema_path, "r", encoding="utf-8") as f:
+            schema_sql = f.read()
+        await db.query(schema_sql)
+    except Exception as e:
+        # Do not crash the app if schema already exists; log in real setup
+        pass
 
 
 async def close_db():

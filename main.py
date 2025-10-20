@@ -9,9 +9,11 @@ from upload_service.upload_route import router as upload_router
 from analysis_service.analysis_routes import router as analysis_router
 from auth.db import init_db, close_db
 import logging
-from config.config import settings
+from settings.config import settings
 from budgets.budget_routes import router as budget_router
 from alerts.alerts_routes import router as alerts_router
+from storage.routes import router as storage_router
+from jobs.routes import router as jobs_router
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +47,8 @@ def get_app() -> FastAPI:
     app.include_router(upload_router)
     app.include_router(analysis_router)
     app.include_router(alerts_router)
+    app.include_router(storage_router)
+    app.include_router(jobs_router)
     if settings.ENABLE_BUDGETS:
         app.include_router(budget_router)
     logger.info("Routers initialized successfully")
