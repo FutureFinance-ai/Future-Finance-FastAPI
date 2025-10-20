@@ -4,7 +4,7 @@ from typing import List
 from aiosmtplib import SMTP
 from email.message import EmailMessage
 
-from config.config import settings
+from settings.config import settings
 
 
 async def send_markdown_email(to_email: str, subject: str, markdown_body: str) -> bool:

@@ -5,7 +5,7 @@ from typing import List
 
 from budgets.budget_model import Budget
 from budgets.budget_repo import BudgetRepo
-from config.db import get_db
+from settings.db import get_db
 from surrealdb import AsyncSurreal
 
 
