@@ -16,6 +16,12 @@ class Settings(BaseSettings):
     SURREALDB_USER: str = "nameofapp"
     SURREALDB_PASS: str = "password123"
 
+    # AWS settings
+    AWS_REGION: str = "us-east-1"
+    AWS_ACCESS_KEY_ID: str = "your-access-key-id"
+    AWS_SECRET_ACCESS_KEY: str = "your-secret-access-key"
+    AWS_S3_BUCKET_NAME: str = "your-bucket-name"
+
     # Auth secrets
     ENV_SECRET: str
     ENV_RESET_PASSWORD_TOKEN_SECRET: str
