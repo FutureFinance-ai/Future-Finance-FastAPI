@@ -6,6 +6,7 @@ from upload_service.upload_service import UploadService
 from surrealdb import AsyncSurreal
 from fastapi import Depends
 from settings.db import get_db
+from auth.auth import get_current_active_user
 
 router = APIRouter(prefix="/upload", tags=["upload"])
 
@@ -18,9 +19,8 @@ async def upload_document(
     file: UploadFile = File(...),
     db: AsyncSurreal = Depends(get_db),
     upload_service: UploadService = Depends(get_upload_service),
-    user_id: str = Depends(get_current_user),
+    user = Depends(get_current_active_user),
 ):
     if file is None or file.filename is None or file.filename.strip() == "":
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file provided")
-
-    return await upload_service.upload_document(db, file, user_id)
+    return await upload_service.upload_document(db, file, user.id)

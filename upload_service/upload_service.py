@@ -2,10 +2,13 @@
 
 from fastapi import UploadFile, HTTPException, status
 from analysis_service.analysis_service import AnalysisService, get_analysis_service
+from settings.config import settings
 from upload_service.models import AccountHeader, TransactionIn
 from upload_service.upload_repo import UploadRepo
 from storage.s3_client import S3Client
 import json
+from surrealdb import AsyncSurreal
+from utils import create_upload_id
 
 
 import os
@@ -15,43 +18,145 @@ class UploadService:
     def __init__(self, analysis_service: AnalysisService | None = None):
         self.analysis_service = analysis_service or get_analysis_service()
 
-    async def upload_document(self, db, file: UploadFile, user_id: str):
+    async def upload_document(self, db: AsyncSurreal, file: UploadFile, user_id):
 
       pdf_file_bytes = await file.read()
       doc_type = await self.process_uploaded_file_check(file)
 
       if doc_type == "pdf":
           try:
-              data = await self.extract_financial_data_llm(pdf_file_bytes)
+            #   data = await self.extract_financial_data_llm(pdf_file_bytes)
               # Upload raw JSON to S3 (cold storage)
+
+              data = {
+  "account_name": "DAVID ADEBAYO BAMIGBOYE",
+  "account_number": "7074347674",
+  "Opening_balance": "900.00",
+  "Closing_balance": "500.00",
+  "transactions": [
+    {
+      "Trans_Time": "2025 May 04 14:56:09",
+      "Value_Date": "04 May 2025",
+      "Description": "Transfer to BAMIGBOYE DAVID ADEBAYO OWealth Withdrawal",
+      "Debit_Credit_N": "-900.00",
+      "Balance_N": "0.00",
+      "Channel": "E-Channel",
+      "Transaction_Reference": "100004250504145620132082902081",
+      "Counterparty": "Guaranty Trust Bank | 0422632365"
+    },
+    {
+      "Trans_Time": "2025 May 04 14:56:19",
+      "Value_Date": "04 May 2025",
+      "Description": "OWealth Withdrawal (Transaction Payment)",
+      "Debit_Credit_N": "+900.00",
+      "Balance_N": "900.00",
+      "Channel": "E-Channel",
+      "Transaction_Reference": "250504010200528733739625",
+      "Counterparty": ""
+    },
+    {
+      "Trans_Time": "2025 May 05 21:45:37",
+      "Value_Date": "05 May 2025",
+      "Description": "Transfer from ODIMAYO ADUKE ROSEMARY",
+      "Debit_Credit_N": "+20,000.00",
+      "Balance_N": "20,000.00",
+      "Channel": "E-Channel",
+      "Transaction_Reference": "000016250505224533000486474395",
+      "Counterparty": "First Bank Of Nigeria | 3030252241"
+    },
+    {
+      "Trans_Time": "2025 May 05 21:45:42",
+      "Value_Date": "05 May 2025",
+      "Description": "Electronic Money Transfer Levy",
+      "Debit_Credit_N": "-50.00",
+      "Balance_N": "19,950.00",
+      "Channel": "E-Channel",
+      "Transaction_Reference": "250505140200553546542735",
+      "Counterparty": ""
+    },
+    {
+      "Trans_Time": "2025 May 06 18:48:37",
+      "Value_Date": "06 May 2025",
+      "Description": "Transfer to BOYS LEADERSHIP ACADEMY LTD-BARBERS 4 KINGS ENTERPRISE",
+      "Debit_Credit_N": "-2,500.00",
+      "Balance_N": "17,450.00",
+      "Channel": "E-Channel",
+      "Transaction_Reference": "100004250506184853132234309106",
+      "Counterparty": "MONIE POINT 5738888694"
+    },
+    {
+      "Trans_Time": "2025 May 06 21:16:58",
+      "Value_Date": "06 May 2025",
+      "Description": "Auto-save to OWealth Balance",
+      "Debit_Credit_N": "-17,450.00",
+      "Balance_N": "0.00",
+      "Channel": "E-Channel",
+      "Transaction_Reference": "250506140200570931084116",
+      "Counterparty": ""
+    },
+    {
+      "Trans_Time": "2025 May 07 15:51:14",
+      "Value_Date": "07 May 2025",
+      "Description": "Transfer to BAMIGBOYE ADEBAYO DAVID OWealth Withdrawal",
+      "Debit_Credit_N": "-5,000.00",
+      "Balance_N": "0.00",
+      "Channel": "E-Channel",
+      "Transaction_Reference": "100004250507155121132288772249",
+      "Counterparty": "Keystone Bank | 6049312015"
+    },
+                ]
+              }
               
               raw_json_str = json.dumps(data)
-              s3_key = f"statements/{file.filename}.json"
-              s3_url = await S3Client().put_text(bucket="${S3_BUCKET_RAW_JSON}", key=s3_key, text=raw_json_str)
+              upload_id = create_upload_id()
+            #   try:
+            #     s3_key = f"statements/{user_id}/{upload_id}_{file.filename}.json"
+            #     s3_url = await S3Client().put_text(bucket=settings.AWS_S3_BUCKET_NAME, key=s3_key, text=raw_json_str)
+            #   except Exception as e:
+            #     print(f"Error uploading file to S3: {e}")
+            #     return {"status": "error", "message": f"Error uploading file to S3: {e}"}
               # Enqueue background job (scaffold)
               # Persist immediately with bulk insert for now
-              header = AccountHeader(
-                  account_name=data.get("account_name", ""),
-                  account_number=data.get("account_number", ""),
-                  opening_balance=float(data.get("opening_balance", 0.0) or 0.0),
-                  closing_balance=float(data.get("closing_balance", 0.0) or 0.0),
-              )
-              txns = [
-                  TransactionIn(
-                      trans_time=tx.get("trans_time") or tx.get("transaction_date"),
-                      value_date=tx.get("value_date") or tx.get("transaction_date"),
-                      description=tx.get("description") or tx.get("transaction_description", ""),
-                      debit=tx.get("debit", 0.0),
-                      credit=tx.get("credit", 0.0),
-                      balance=tx.get("balance"),
-                  )
-                  for tx in data.get("transactions", [])
-              ]
-              await UploadRepo(db).save_user_upload(user_id="current", account_header=header, transactions=txns, s3_url=s3_url)
+
+              try:
+                header = AccountHeader(
+                    account_name=str(data.get("account_name") or data.get("Account_Name", "")),
+                    account_number=str(data.get("account_number") or data.get("Account_Number", "")),
+                    opening_balance=float(data.get("opening_balance") or data.get("Opening_balance") or 0.0),
+                    closing_balance=float(data.get("closing_balance") or data.get("Closing_balance") or 0.0),
+                )
+                def split_signed_amount(raw: str | float | int | None) -> tuple[float, float]:
+                    if raw is None:
+                        return 0.0, 0.0
+                    s = str(raw).strip()
+                    if s.startswith("-") or (s.startswith("(") and s.endswith(")")):
+                        return s, 0.0
+                    return 0.0, s
+                txns = [
+                    TransactionIn(
+                        trans_time=tx.get("Trans_Time") or tx.get("transaction_date"),
+                        value_date=tx.get("Value_Date") or tx.get("transaction_date"),
+                        description=tx.get("Description") or tx.get("description") or tx.get("transaction_description", ""),
+                        debit=split_signed_amount(tx.get("Debit_Credit_N"))[0],
+                        credit=split_signed_amount(tx.get("Debit_Credit_N"))[1],
+                        balance=tx.get("Balance_N"),
+                    )
+                    for tx in data.get("transactions", [])
+                ]
+              except Exception as e:
+                print(f"Error creating account header or transactions: {e}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error creating account header or transactions: {e}")
+              s3_url = "text/url"
+              try:
+                res = await UploadRepo(db).save_user_upload(user_id=user_id, account_header=header, transactions=txns, s3_url=s3_url, upload_id=upload_id)
+
+              except Exception as e:
+                print(f"Error saving user upload: {e}")
+                raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error saving user upload: {e}")
               job_id = "queued"
               
               # Optionally return immediate accepted response
-              return {"status": "accepted", "raw_json_url": s3_url, "job_id": job_id}
+              return {"status": "accepted", "raw_json_url": s3_url, "job_id": job_id, "res": res}
           except Exception as e:
               raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error extracting financial data: {e}")
       else:
