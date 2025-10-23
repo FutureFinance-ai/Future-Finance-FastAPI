@@ -87,45 +87,31 @@ class UploadRepo:
             }
             transactions_list_for_db.append(txn_dict)
         try:
+            
             query = """
-                BEGIN TRANSACTION;
+            BEGIN TRANSACTION;
+                LET $acc =(CREATE accounts CONTENT $account_data);
+                LET $acc_id = $acc[0].id;
+                LET $all_txns = (INSERT INTO transactions $transactions_list_for_db);
+                RETURN $acc_id;
+                LET $txn_ids = (SELECT VALUE id FROM $all_txns);
 
-                LET $acc = (CREATE ONLY account CONTENT $account_data);
+                RELATE $user_id->owns->$acc_id;
+                RELATE $acc_id-> has->$txn_ids;
 
-                LET $rows = (SELECT *, account:acc.id FROM $transactions_list);
-
-                LET $txns = (INSERT INTO transaction rows);
-
-                RELATE $user_id->owns->acc;
-
-                FOR $txn IN txns {
-                    RELATE acc.id->has->txn.id;
-                };
-
-                COMMIT TRANSACTION;
-
-                RETURN acc;
+            COMMIT TRANSACTION;
             """
             vars = {
                 "account_data": account_data,
                 "user_id": user_id,
-                "transactions_list": transactions_list_for_db
+                "transactions_list_for_db": transactions_list_for_db
             }
             result = await self.db.query(query, vars)
+            if isinstance(result, str):
+                logger.error(f"Database error: {result}")
+                raise Exception(f"Database error: {result}")
+            logger.info(f"Successfully saved data to database")
             return result
-            
-            # Result is list of query results; last RETURN gives account object
-            # last_result = result[-1]
-            # if isinstance(last_result, dict) and "result" in last_result:
-            #     acc_records = last_result["result"]
-            #     if acc_records and isinstance(acc_records, list):
-            #         account_id = acc_records[0].get("id")
-            #         if not account_id:
-            #             raise Exception("Account ID missing in response")
-            #         logger.info(f"Successfully created account {account_id} with {len(transactions)} transactions")
-            #         return account_id
-            # raise Exception(f"Unexpected response structure: {result}")
         except Exception as e:
             logger.error(f"Error saving user upload: {e}")
-            await self.db.query("CANCEL TRANSACTION;")
             raise e
