@@ -5,6 +5,9 @@ from surrealdb import AsyncSurreal
 from users.user_repo import SurrealUserDatabase
 from settings.config import settings
 import pathlib
+import logging 
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -13,7 +16,9 @@ db = None
 # --- Lifecycle management ---
 async def init_db():
     """Initialize SurrealDB connection on app startup."""
-    
+    logger.info(f"=== Connecting to SurrealDB at: {settings.SURREALDB_URL} ===")
+    logger.info(f"=== Using namespace: {settings.SURREALDB_NS} ===")
+    logger.info(f"=== Using database: {settings.SURREALDB_DB} ===")
     global db
     db = AsyncSurreal(settings.SURREALDB_URL)
     try:
