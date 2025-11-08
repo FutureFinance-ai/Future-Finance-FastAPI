@@ -48,3 +48,25 @@ class TransactionRepo:
         await self.db.query(query, {"account_id": account_id, "period_start": period_start_iso, "credits": credits_minor, "debits": debits_minor, "net": net_minor})
 
 
+    async def get_uncategorized_transactions(self, account_id: str | None = None, user_id: str | None = None, limit: int = 200) -> list[dict]:
+        filters = ["(category = NONE OR category = 'Uncategorized')"]
+        vars: dict = {"limit": limit}
+        if account_id:
+            filters.append("account = type::thing($account_id)")
+            vars["account_id"] = account_id
+        if user_id:
+            filters.append("account.owner = type::thing($user_id)")
+            vars["user_id"] = user_id
+        where_clause = " AND ".join(filters)
+        query = f"SELECT id, description FROM transaction WHERE {where_clause} ORDER BY value_date ASC LIMIT $limit;"
+        res = await self.db.query(query, vars)
+        return res[0]
+
+    async def update_category(self, txn_id: str, category: str, merchant_name: str | None = None, is_subscription: bool | None = None) -> None:
+        query = "UPDATE $id SET category = $category, merchant_name = $merchant, is_subscription = $is_sub, ai_categorized_at = time::now();"
+        await self.db.query(query, {"id": txn_id, "category": category, "merchant": merchant_name, "is_sub": is_subscription})
+
+    async def record_user_correction(self, txn_id: str, corrected_category: str) -> None:
+        query = "UPDATE $id SET user_corrected_category = $corrected, category = $corrected;"
+        await self.db.query(query, {"id": txn_id, "corrected": corrected_category})
+

@@ -20,3 +20,6 @@ aiosmtplib==3.0.2
 aioboto3==13.1.1
 arq==0.26.0
 redis
+celery==5.4.0
+scikit-learn==1.5.2
+joblib==1.4.2

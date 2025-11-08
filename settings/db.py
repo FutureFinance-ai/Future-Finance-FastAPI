@@ -68,6 +68,16 @@ async def get_user_db(db: AsyncSurreal = Depends(get_db)):
     yield SurrealUserDatabase(db, "users")  # type: ignore
 
 
+async def get_service_db() -> AsyncSurreal:
+    """
+    Return a dedicated SurrealDB client using service credentials.
+    Intended for background workers and admin-level operations.
+    """
+    client = AsyncSurreal(settings.SURREALDB_URL)
+    await client.signin({"username": settings.SURREALDB_USER, "password": settings.SURREALDB_PASS})
+    await client.use(settings.SURREALDB_NS, settings.SURREALDB_DB)
+    return client
+
 
 
 

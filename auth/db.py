@@ -37,6 +37,10 @@ async def init_db():
         with open(schema_path, "r", encoding="utf-8") as f:
             schema_sql = f.read()
         await db.query(schema_sql)
+        # Load tenant/membership schema in global (auth) namespace
+        tenant_schema_path = pathlib.Path(__file__).resolve().parents[1] / "settings" / "surreal" / "tenant_schema.surql"
+        with open(tenant_schema_path, "r", encoding="utf-8") as f:
+            await db.query(f.read())
     except Exception as e:
         # Do not crash the app if schema already exists; log in real setup
         pass
