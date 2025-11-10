@@ -4,7 +4,7 @@ from fastapi_users import FastAPIUsers
 from fastapi_users.authentication import AuthenticationBackend, BearerTransport, JWTStrategy
 from fastapi import Depends
 
-from .models import User
+from .schemas import UserRead as User
 from .user_manager import get_user_manager
 from .config import settings
 

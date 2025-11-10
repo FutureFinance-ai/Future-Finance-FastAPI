@@ -9,6 +9,8 @@ from storage.s3_client import S3Client
 import json
 from surrealdb import AsyncSurreal
 from utils import create_upload_id
+from arq import create_pool
+from arq.connections import RedisSettings
 
 
 import os
@@ -153,7 +155,14 @@ class UploadService:
               except Exception as e:
                 print(f"Error saving user upload: {e}")
                 raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Error saving user upload: {e}")
-              job_id = "queued"
+              # Enqueue categorization for this user's new transactions
+              try:
+                redis = RedisSettings.from_dsn(settings.REDIS_URL or "redis://localhost:6379")
+                q = await create_pool(redis)
+                job = await q.enqueue_job("categorize_new_transactions", user_id=user_id)
+                job_id = str(job.job_id)
+              except Exception:
+                job_id = "queued"
               
               # Optionally return immediate accepted response
               return {"status": "accepted", "raw_json_url": s3_url, "job_id": job_id, "res": res}

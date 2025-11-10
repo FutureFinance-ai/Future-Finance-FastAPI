@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from surrealdb import AsyncSurreal
 from upload_service.models import AccountHeader, TransactionIn
 import logging
+import hashlib
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -73,7 +74,11 @@ class UploadRepo:
             parsed_trans_time = self._parse_datetime(txn.trans_time)
             parsed_value_date = self._parse_datetime(txn.value_date)
 
+            # Compute idempotency key and deterministic id
+            idem_raw = f"{upload_id}|{parsed_trans_time}|{txn.description}|{amount_minor}"
+            idem_key = hashlib.sha256(idem_raw.encode("utf-8")).hexdigest()
             txn_dict = {
+                "id": f"transaction:{idem_key[:24]}",
                 "trans_time": parsed_trans_time,
                 "value_date": parsed_value_date,
                 "description": txn.description,
@@ -82,6 +87,7 @@ class UploadRepo:
                 "credit": credit,
                 "balance": balance,
                 "upload_id": upload_id, # Link back to the specific upload
+                "idempotency_key": idem_key,
                 "created_at": datetime.datetime.utcnow().isoformat() + "Z"
                 # Add category, counterparty etc. if available in Transaction model
             }
